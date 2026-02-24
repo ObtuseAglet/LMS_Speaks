@@ -1,0 +1,40 @@
+{
+  "name": "lms-speaks",
+  "version": "1.0.0",
+  "description": "Text To Speech plugin for LMStudio",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "test": "npm run build && node --test dist/server.test.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ObtuseAglet/LMS_Speaks.git"
+  },
+  "keywords": [
+    "lmstudio",
+    "plugin",
+    "tts",
+    "text-to-speech",
+    "llm"
+  ],
+  "author": "",
+  "license": "MIT",
+  "type": "module",
+  "bugs": {
+    "url": "https://github.com/ObtuseAglet/LMS_Speaks/issues"
+  },
+  "homepage": "https://github.com/ObtuseAglet/LMS_Speaks#readme",
+  "dependencies": {
+    "@lmstudio/sdk": "^1.5.0",
+    "express": "^4.21.2"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^25.3.0",
+    "tsx": "^4.19.3",
+    "typescript": "^5.7.3"
+  }
+}

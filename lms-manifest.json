@@ -1,0 +1,7 @@
+{
+  "owner": "obtuseaglet",
+  "name": "lms-speaks",
+  "type": "plugin",
+  "runner": "node",
+  "tags": ["tts", "text-to-speech", "audio"]
+}
