@@ -45,7 +45,10 @@ async function main(): Promise<void> {
     const server = new TtsServer({ engine, port, defaultVoice: voice });
     await server.start();
 
+    let isShuttingDown = false;
     const shutdown = async () => {
+      if (isShuttingDown) return;
+      isShuttingDown = true;
       console.info("[LMS Speaks] Shutting down…");
       await server.stop();
       process.exit(0);
@@ -93,7 +96,10 @@ async function main(): Promise<void> {
   // ----------------------------------------------------------------
   // Graceful shutdown
   // ----------------------------------------------------------------
+  let isShuttingDown = false;
   const shutdown = async () => {
+    if (isShuttingDown) return;
+    isShuttingDown = true;
     console.info("[LMS Speaks] Shutting down…");
     await server.stop();
     await client[Symbol.asyncDispose]();

@@ -33,10 +33,9 @@ export const globalConfigSchematics = createConfigSchematics()
     "select",
     {
       displayName: "TTS Engine",
-      hint: "The TTS backend: 'system' uses OS speech synthesis; 'lmstudio' uses a loaded TTS model.",
+      hint: "The TTS backend to use for speech synthesis.",
       options: [
         { value: "system", displayName: "System (OS built-in)" },
-        { value: "lmstudio", displayName: "LM Studio TTS model" },
       ],
     },
     "system"

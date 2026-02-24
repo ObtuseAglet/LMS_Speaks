@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { platform } from "node:os";
+import { readFileSync } from "node:fs";
 import { writeFile, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -85,34 +86,39 @@ export class SystemTtsEngine extends TtsEngine {
     }
   }
 
-  private synthesizeMac(
+  private async synthesizeMac(
     text: string,
     voice: string,
     speed: number,
     tmpFile: string
   ): Promise<SynthesisResult> {
-    return new Promise((resolve, reject) => {
-      const outputPath = `${tmpFile}.wav`;
-      const voiceArgs = voice !== "default" ? ["-v", voice] : [];
-      // macOS `say` rate is words-per-minute; 200 wpm ≈ 1× speed.
-      const rate = Math.round(200 * speed);
-      const args = [
-        ...voiceArgs,
-        "-r",
-        String(rate),
-        "-o",
-        outputPath,
-        "--data-format=LEI16@22050",
-        text,
-      ];
-      const proc = spawn("say", args);
-      proc.on("error", reject);
-      proc.on("close", (code) => {
-        if (code !== 0) {
-          reject(new Error(`say exited with code ${code}`));
-          return;
-        }
-        import("node:fs").then(({ readFileSync }) => {
+    const outputPath = `${tmpFile}.wav`;
+    // Write text to a temp file so it is never interpolated into a command line.
+    const inputFile = `${tmpFile}.txt`;
+    await writeFile(inputFile, text, "utf8");
+
+    try {
+      return await new Promise((resolve, reject) => {
+        const voiceArgs = voice !== "default" ? ["-v", voice] : [];
+        // macOS `say` rate is words-per-minute; 200 wpm ≈ 1× speed.
+        const rate = Math.round(200 * speed);
+        const args = [
+          ...voiceArgs,
+          "-r",
+          String(rate),
+          "-o",
+          outputPath,
+          "--data-format=LEI16@22050",
+          "-f",
+          inputFile,
+        ];
+        const proc = spawn("say", args);
+        proc.on("error", reject);
+        proc.on("close", (code) => {
+          if (code !== 0) {
+            reject(new Error(`say exited with code ${code}`));
+            return;
+          }
           try {
             const audio = readFileSync(outputPath);
             unlink(outputPath).catch(() => {});
@@ -122,7 +128,9 @@ export class SystemTtsEngine extends TtsEngine {
           }
         });
       });
-    });
+    } finally {
+      await unlink(inputFile).catch(() => {});
+    }
   }
 
   private synthesizeWindows(
@@ -133,12 +141,10 @@ export class SystemTtsEngine extends TtsEngine {
   ): Promise<SynthesisResult> {
     return new Promise((resolve, reject) => {
       const outputPath = `${tmpFile}.wav`;
-      const escapedText = text.replace(/'/g, "''");
-      const escapedVoice =
-        voice !== "default" ? voice.replace(/'/g, "''") : "";
-      const voiceCmd = escapedVoice
-        ? `$s.SelectVoice('${escapedVoice}'); `
-        : "";
+      // Use a here-string variable for the text so that no user-supplied
+      // characters are ever interpolated as PowerShell syntax.
+      const voiceCmd =
+        voice !== "default" ? `$s.SelectVoice($env:TTS_VOICE); ` : "";
       // Windows SAPI rate: –10 (slowest) to 10 (fastest); 0 = normal (≈ 150 wpm).
       const rate = Math.max(-10, Math.min(10, Math.round((speed - 1) * 5)));
       const script = [
@@ -146,26 +152,38 @@ export class SystemTtsEngine extends TtsEngine {
         "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer;",
         voiceCmd,
         `$s.Rate = ${rate};`,
-        `$s.SetOutputToWaveFile('${outputPath}');`,
-        `$s.Speak('${escapedText}');`,
+        `$s.SetOutputToWaveFile($env:TTS_OUTPUT);`,
+        "$s.Speak($env:TTS_INPUT);",
         "$s.Dispose();",
       ].join(" ");
-      const proc = spawn("powershell", ["-NoProfile", "-Command", script]);
+      // Encode the script as UTF-16LE Base64 for -EncodedCommand to prevent
+      // any injection of user-supplied text or voice into the PS command line.
+      const encodedScript = Buffer.from(script, "utf16le").toString("base64");
+      const proc = spawn(
+        "powershell",
+        ["-NoProfile", "-EncodedCommand", encodedScript],
+        {
+          env: {
+            ...process.env,
+            TTS_INPUT: text,
+            TTS_OUTPUT: outputPath,
+            TTS_VOICE: voice !== "default" ? voice : "",
+          },
+        }
+      );
       proc.on("error", reject);
       proc.on("close", (code) => {
         if (code !== 0) {
           reject(new Error(`PowerShell exited with code ${code}`));
           return;
         }
-        import("node:fs").then(({ readFileSync }) => {
-          try {
-            const audio = readFileSync(outputPath);
-            unlink(outputPath).catch(() => {});
-            resolve({ audio, format: "wav" });
-          } catch (e) {
-            reject(e);
-          }
-        });
+        try {
+          const audio = readFileSync(outputPath);
+          unlink(outputPath).catch(() => {});
+          resolve({ audio, format: "wav" });
+        } catch (e) {
+          reject(e);
+        }
       });
     });
   }
@@ -197,42 +215,55 @@ export class SystemTtsEngine extends TtsEngine {
           inputFile,
         ];
 
+        // Use a flag so that only one resolution path executes even if
+        // both the "error" and "close" events fire for the same process.
+        let eventHandled = false;
+
+        const readResult = () => {
+          try {
+            const audio = readFileSync(outputPath);
+            unlink(outputPath).catch(() => {});
+            resolve({ audio, format: "wav" });
+          } catch (e) {
+            reject(e);
+          }
+        };
+
+        const runFallback = () => {
+          // espeak-ng not found – try plain espeak.
+          const fallback = spawn("espeak", args);
+          const fstderr: Buffer[] = [];
+          fallback.stderr.on("data", (d: Buffer) => fstderr.push(d));
+          fallback.on("error", reject);
+          fallback.on("close", (code) => {
+            if (code !== 0) {
+              reject(
+                new Error(
+                  `espeak exited with code ${code}: ${Buffer.concat(fstderr).toString()}`
+                )
+              );
+              return;
+            }
+            readResult();
+          });
+        };
+
         // Prefer espeak-ng; fall back to espeak.
-        const bin = "espeak-ng";
-        const proc = spawn(bin, args);
+        const proc = spawn("espeak-ng", args);
         const stderr: Buffer[] = [];
         proc.stderr.on("data", (d: Buffer) => stderr.push(d));
         proc.on("error", (err) => {
+          if (eventHandled) return;
+          eventHandled = true;
           if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-            // espeak-ng not found – try plain espeak.
-            const fallback = spawn("espeak", args);
-            const fstderr: Buffer[] = [];
-            fallback.stderr.on("data", (d: Buffer) => fstderr.push(d));
-            fallback.on("error", reject);
-            fallback.on("close", (code) => {
-              if (code !== 0) {
-                reject(
-                  new Error(
-                    `espeak exited with code ${code}: ${Buffer.concat(fstderr).toString()}`
-                  )
-                );
-                return;
-              }
-              import("node:fs").then(({ readFileSync }) => {
-                try {
-                  const audio = readFileSync(outputPath);
-                  unlink(outputPath).catch(() => {});
-                  resolve({ audio, format: "wav" });
-                } catch (e) {
-                  reject(e);
-                }
-              });
-            });
+            runFallback();
           } else {
             reject(err);
           }
         });
         proc.on("close", (code) => {
+          if (eventHandled) return;
+          eventHandled = true;
           if (code !== 0) {
             reject(
               new Error(
@@ -241,15 +272,7 @@ export class SystemTtsEngine extends TtsEngine {
             );
             return;
           }
-          import("node:fs").then(({ readFileSync }) => {
-            try {
-              const audio = readFileSync(outputPath);
-              unlink(outputPath).catch(() => {});
-              resolve({ audio, format: "wav" });
-            } catch (e) {
-              reject(e);
-            }
-          });
+          readResult();
         });
       });
     } finally {
@@ -331,8 +354,13 @@ export class SystemTtsEngine extends TtsEngine {
     return new Promise((resolve) => {
       const proc = spawn("espeak-ng", ["--voices"]);
       const chunks: Buffer[] = [];
+      // Use a flag to ensure resolve() is called at most once even when
+      // both the "error" and "close" events fire for the same process.
+      let eventHandled = false;
       proc.stdout.on("data", (d: Buffer) => chunks.push(d));
       proc.on("error", () => {
+        if (eventHandled) return;
+        eventHandled = true;
         // Try plain espeak as fallback.
         const proc2 = spawn("espeak", ["--voices"]);
         const chunks2: Buffer[] = [];
@@ -342,7 +370,11 @@ export class SystemTtsEngine extends TtsEngine {
           resolve([{ id: "default", name: "Default (Linux)" }])
         );
       });
-      proc.on("close", () => parseEspeakVoices(chunks, resolve));
+      proc.on("close", () => {
+        if (eventHandled) return;
+        eventHandled = true;
+        parseEspeakVoices(chunks, resolve);
+      });
     });
 
     function parseEspeakVoices(

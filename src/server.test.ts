@@ -15,7 +15,6 @@ import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import type { TtsEngine, SynthesisOptions, SynthesisResult, VoiceInfo } from "./tts-engine.js";
 import { TtsServer } from "./server.js";
-
 // ---------------------------------------------------------------------------
 // Mock engine
 // ---------------------------------------------------------------------------
@@ -204,6 +203,61 @@ describe("TtsServer", () => {
       assert.equal(status, 500);
       const b = body as { error: { type: string } };
       assert.equal(b.error.type, "server_error");
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Concurrency limiting
+  // -------------------------------------------------------------------------
+  describe("Concurrency limiting", () => {
+    it("returns 429 when maxConcurrency is exceeded", async () => {
+      // Create a separate server with maxConcurrency=1 and a slow engine so
+      // we can hold the first slot open while firing a second request.
+      // Use a ref object to avoid TypeScript narrowing the closure variable to never.
+      const ref = { releaseFirst: null as ((() => void) | null) };
+      class SlowEngine implements TtsEngine {
+        async synthesize(_opts: SynthesisOptions): Promise<SynthesisResult> {
+          await new Promise<void>((r) => { ref.releaseFirst = r; });
+          return { audio: Buffer.from("X"), format: "wav" };
+        }
+        async listVoices(): Promise<VoiceInfo[]> { return []; }
+      }
+
+      const slowServer = new TtsServer({
+        engine: new SlowEngine(),
+        port: 18881,
+        maxConcurrency: 1,
+        logger: { info: () => {}, warn: () => {}, error: () => {} },
+      });
+      await slowServer.start();
+
+      try {
+        // Fire first request (will block in SlowEngine).
+        const first = fetch("http://127.0.0.1:18881/v1/audio/speech", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ input: "hold" }),
+        });
+
+        // Give the first request time to enter synthesize().
+        await new Promise((r) => setTimeout(r, 50));
+
+        // Fire second request – should get 429.
+        const second = await fetch("http://127.0.0.1:18881/v1/audio/speech", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ input: "blocked" }),
+        });
+        assert.equal(second.status, 429);
+        const b = (await second.json()) as { error: { type: string } };
+        assert.equal(b.error.type, "rate_limit_error");
+
+        // Unblock the first request.
+        ref.releaseFirst?.();
+        await first;
+      } finally {
+        await slowServer.stop();
+      }
     });
   });
 });

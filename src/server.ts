@@ -31,8 +31,21 @@ export interface TtsServerOptions {
   engine: TtsEngine;
   /** TCP port to listen on (default: 8880). */
   port?: number;
+  /**
+   * Host/IP address to bind to (default: "127.0.0.1").
+   *
+   * **Security note**: The default binds only to loopback. Setting this to
+   * "0.0.0.0" exposes the server on all interfaces; only do this on a
+   * trusted network.
+   */
+  host?: string;
   /** Default voice name when the caller does not provide one. */
   defaultVoice?: string;
+  /**
+   * Maximum number of synthesis requests processed concurrently (default: 5).
+   * Requests arriving while the limit is reached receive a 429 response.
+   */
+  maxConcurrency?: number;
   /** Optional logger; defaults to console. */
   logger?: Pick<Console, "info" | "warn" | "error">;
 }
@@ -52,13 +65,18 @@ export class TtsServer {
   private server: Server | null = null;
   private readonly engine: TtsEngine;
   private readonly port: number;
+  private readonly host: string;
   private readonly defaultVoice: string;
+  private readonly maxConcurrency: number;
+  private activeSynthesisCount = 0;
   private readonly log: Pick<Console, "info" | "warn" | "error">;
 
   constructor(opts: TtsServerOptions) {
     this.engine = opts.engine;
     this.port = opts.port ?? 8880;
+    this.host = opts.host ?? "127.0.0.1";
     this.defaultVoice = opts.defaultVoice ?? "default";
+    this.maxConcurrency = opts.maxConcurrency ?? 5;
     this.log = opts.logger ?? console;
     this.app = express();
     this.registerMiddleware();
@@ -116,6 +134,30 @@ export class TtsServer {
           return;
         }
 
+        // Warn callers that the model parameter has no effect; the system TTS
+        // engine uses a fixed OS voice and does not differentiate between
+        // tts-1 and tts-1-hd quality tiers.
+        if (model !== undefined && model !== null) {
+          this.log.warn(
+            `[TTS] 'model' parameter "${model}" is accepted but currently ignored; ` +
+              "the system TTS engine uses its OS-default configuration."
+          );
+        }
+
+        // The system TTS engine always returns WAV audio regardless of the
+        // requested response_format.  The MIME type in the response reflects
+        // the actual format returned by the engine, not the requested one.
+        if (
+          typeof response_format === "string" &&
+          response_format !== "wav" &&
+          SUPPORTED_FORMATS.has(response_format)
+        ) {
+          this.log.warn(
+            `[TTS] response_format="${response_format}" requested, but the system TTS engine ` +
+              "only produces WAV audio. Returning WAV."
+          );
+        }
+
         const format =
           typeof response_format === "string" &&
           SUPPORTED_FORMATS.has(response_format)
@@ -132,10 +174,27 @@ export class TtsServer {
             ? voice.trim()
             : this.defaultVoice;
 
+        // Concurrency guard – prevent resource exhaustion from many parallel
+        // TTS requests (each spawns an OS process and writes a temp file).
+        if (this.activeSynthesisCount >= this.maxConcurrency) {
+          res.status(429).json({
+            error: {
+              message:
+                `Too many concurrent synthesis requests (max ${this.maxConcurrency}). ` +
+                "Please retry after a moment.",
+              type: "rate_limit_error",
+              param: null,
+              code: null,
+            },
+          });
+          return;
+        }
+
         this.log.info(
-          `[TTS] Synthesizing ${input.length} chars via model="${model ?? "default"}" voice="${resolvedVoice}" format=${format} speed=${parsedSpeed}`
+          `[TTS] Synthesizing ${input.length} chars via voice="${resolvedVoice}" format=${format} speed=${parsedSpeed}`
         );
 
+        this.activeSynthesisCount++;
         try {
           const result = await this.engine.synthesize({
             text: input,
@@ -161,6 +220,8 @@ export class TtsServer {
               code: null,
             },
           });
+        } finally {
+          this.activeSynthesisCount--;
         }
       }
     );
@@ -228,9 +289,9 @@ export class TtsServer {
   /** Start the HTTP server and begin accepting connections. */
   start(): Promise<void> {
     return new Promise((resolve, reject) => {
-      this.server = this.app.listen(this.port, "127.0.0.1", () => {
+      this.server = this.app.listen(this.port, this.host, () => {
         this.log.info(
-          `[TTS] Server listening on http://127.0.0.1:${this.port}`
+          `[TTS] Server listening on http://${this.host}:${this.port}`
         );
         resolve();
       });
