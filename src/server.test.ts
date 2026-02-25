@@ -13,7 +13,8 @@
 
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import type { TtsEngine, SynthesisOptions, SynthesisResult, VoiceInfo } from "./tts-engine.js";
+import { TtsEngine } from "./tts-engine.js";
+import type { SynthesisOptions, SynthesisResult, VoiceInfo } from "./tts-engine.js";
 import { TtsServer } from "./server.js";
 // ---------------------------------------------------------------------------
 // Mock engine
@@ -21,7 +22,7 @@ import { TtsServer } from "./server.js";
 
 const FAKE_AUDIO = Buffer.from("FAKE_AUDIO_DATA");
 
-class MockTtsEngine implements TtsEngine {
+class MockTtsEngine extends TtsEngine {
   async synthesize(opts: SynthesisOptions): Promise<SynthesisResult> {
     if (opts.text === "FAIL") {
       throw new Error("Simulated synthesis failure");
@@ -215,7 +216,7 @@ describe("TtsServer", () => {
       // we can hold the first slot open while firing a second request.
       // Use a ref object to avoid TypeScript narrowing the closure variable to never.
       const ref = { releaseFirst: null as ((() => void) | null) };
-      class SlowEngine implements TtsEngine {
+      class SlowEngine extends TtsEngine {
         async synthesize(_opts: SynthesisOptions): Promise<SynthesisResult> {
           await new Promise<void>((r) => { ref.releaseFirst = r; });
           return { audio: Buffer.from("X"), format: "wav" };
@@ -258,6 +259,140 @@ describe("TtsServer", () => {
       } finally {
         await slowServer.stop();
       }
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// LmStudioTtsEngine tests
+// ---------------------------------------------------------------------------
+
+import { LmStudioTtsEngine } from "./tts-engine.js";
+import type { TtsModelInfo } from "./tts-engine.js";
+import http from "node:http";
+
+describe("LmStudioTtsEngine", () => {
+  // Spin up a tiny HTTP server that emulates a subset of the LM Studio API.
+  let fakeApi: http.Server;
+  const FAKE_API_PORT = 18882;
+  const FAKE_API_BASE = `http://127.0.0.1:${FAKE_API_PORT}`;
+
+  before(async () => {
+    fakeApi = http.createServer((req, res) => {
+      if (req.method === "POST" && req.url === "/v1/audio/speech") {
+        let body = "";
+        req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
+        req.on("end", () => {
+          const parsed = JSON.parse(body);
+          if (parsed.input === "FAIL") {
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: { message: "model error" } }));
+            return;
+          }
+          res.writeHead(200, { "Content-Type": "audio/wav" });
+          res.end(Buffer.from("LMSTUDIO_AUDIO"));
+        });
+        return;
+      }
+
+      if (req.method === "GET" && req.url === "/v1/models") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          data: [
+            { id: "tts-kokoro", owned_by: "lmstudio" },
+          ],
+        }));
+        return;
+      }
+
+      res.writeHead(404);
+      res.end();
+    });
+
+    await new Promise<void>((resolve) => {
+      fakeApi.listen(FAKE_API_PORT, "127.0.0.1", resolve);
+    });
+  });
+
+  after(async () => {
+    await new Promise<void>((resolve, reject) => {
+      fakeApi.close((err) => (err ? reject(err) : resolve()));
+    });
+  });
+
+  it("synthesizes audio via the LM Studio API", async () => {
+    const engine = new LmStudioTtsEngine({ apiBaseUrl: FAKE_API_BASE });
+    const result = await engine.synthesize({ text: "Hello" });
+    assert.deepEqual(result.audio, Buffer.from("LMSTUDIO_AUDIO"));
+    assert.equal(result.format, "wav");
+  });
+
+  it("throws when the LM Studio API returns an error", async () => {
+    const engine = new LmStudioTtsEngine({ apiBaseUrl: FAKE_API_BASE });
+    await assert.rejects(
+      () => engine.synthesize({ text: "FAIL" }),
+      (err: Error) => {
+        assert.ok(err.message.includes("LM Studio TTS request failed"));
+        assert.ok(err.message.includes("model error"));
+        return true;
+      }
+    );
+  });
+
+  it("lists voices with a default entry", async () => {
+    const engine = new LmStudioTtsEngine({ apiBaseUrl: FAKE_API_BASE });
+    const voices = await engine.listVoices();
+    assert.equal(voices.length, 1);
+    assert.equal(voices[0].id, "default");
+  });
+
+  it("lists models from the LM Studio API", async () => {
+    const engine = new LmStudioTtsEngine({ apiBaseUrl: FAKE_API_BASE });
+    const models: TtsModelInfo[] = await engine.listModels();
+    assert.ok(models.some((m) => m.id === "tts-kokoro"));
+  });
+
+  it("sends model key in the synthesis request body", async () => {
+    const engine = new LmStudioTtsEngine({
+      apiBaseUrl: FAKE_API_BASE,
+      modelKey: "my-tts-model",
+    });
+    // The fake API doesn't validate the model field – it just echoes audio.
+    const result = await engine.synthesize({ text: "test" });
+    assert.deepEqual(result.audio, Buffer.from("LMSTUDIO_AUDIO"));
+  });
+
+  // Test the TtsServer + LmStudioTtsEngine integration to verify that the
+  // /v1/models endpoint now returns models from the engine's listModels().
+  describe("TtsServer with LmStudioTtsEngine", () => {
+    let lmsServer: TtsServer;
+    const LMS_PORT = 18883;
+    const LMS_BASE = `http://127.0.0.1:${LMS_PORT}`;
+
+    before(async () => {
+      const engine = new LmStudioTtsEngine({ apiBaseUrl: FAKE_API_BASE });
+      lmsServer = new TtsServer({
+        engine,
+        port: LMS_PORT,
+        logger: { info: () => {}, warn: () => {}, error: () => {} },
+      });
+      await lmsServer.start();
+    });
+
+    after(async () => {
+      await lmsServer.stop();
+    });
+
+    it("GET /v1/models returns models from LM Studio", async () => {
+      const res = await fetch(`${LMS_BASE}/v1/models`);
+      assert.equal(res.status, 200);
+      const body = (await res.json()) as {
+        object: string;
+        data: Array<{ id: string; owned_by: string }>;
+      };
+      assert.equal(body.object, "list");
+      assert.ok(body.data.some((m) => m.id === "tts-kokoro"));
+      assert.ok(body.data.some((m) => m.owned_by === "lmstudio"));
     });
   });
 });

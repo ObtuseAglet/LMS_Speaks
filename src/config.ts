@@ -36,9 +36,30 @@ export const globalConfigSchematics = createConfigSchematics()
       hint: "The TTS backend to use for speech synthesis.",
       options: [
         { value: "system", displayName: "System (OS built-in)" },
+        { value: "lmstudio", displayName: "LM Studio (loaded TTS model)" },
       ],
     },
     "system"
+  )
+  .field(
+    "lmsApiBaseUrl",
+    "string",
+    {
+      displayName: "LM Studio API Base URL",
+      hint: "Base URL of the LM Studio HTTP API server (used when TTS Engine is set to LM Studio).",
+      placeholder: "http://127.0.0.1:1234",
+    },
+    "http://127.0.0.1:1234"
+  )
+  .field(
+    "ttsModelKey",
+    "string",
+    {
+      displayName: "TTS Model",
+      hint: "Model key (path) of the TTS model to load in LM Studio. Leave empty to use whatever model is already loaded.",
+      placeholder: "",
+    },
+    ""
   )
   .build();
 
