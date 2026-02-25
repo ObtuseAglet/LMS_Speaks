@@ -257,25 +257,42 @@ export class TtsServer {
     // GET /v1/models
     // Returns a minimal OpenAI-compatible model list with TTS model entries.
     // -----------------------------------------------------------------------
-    this.app.get("/v1/models", (_req: Request, res: Response): void => {
-      res.json({
-        object: "list",
-        data: [
-          {
-            id: "tts-1",
-            object: "model",
-            created: 1699000000,
-            owned_by: "lms-speaks",
-          },
-          {
-            id: "tts-1-hd",
-            object: "model",
-            created: 1699000000,
-            owned_by: "lms-speaks",
-          },
-        ],
-      });
-    });
+    this.app.get(
+      "/v1/models",
+      async (_req: Request, res: Response): Promise<void> => {
+        try {
+          const models = await this.engine.listModels();
+          res.json({
+            object: "list",
+            data: models.map((m) => ({
+              id: m.id,
+              object: "model",
+              created: 1699000000,
+              owned_by: m.owned_by,
+            })),
+          });
+        } catch (err) {
+          this.log.error("[TTS] listModels error:", err);
+          res.json({
+            object: "list",
+            data: [
+              {
+                id: "tts-1",
+                object: "model",
+                created: 1699000000,
+                owned_by: "lms-speaks",
+              },
+              {
+                id: "tts-1-hd",
+                object: "model",
+                created: 1699000000,
+                owned_by: "lms-speaks",
+              },
+            ],
+          });
+        }
+      }
+    );
 
     // -----------------------------------------------------------------------
     // GET /health
