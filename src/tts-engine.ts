@@ -37,10 +37,28 @@ export interface VoiceInfo {
   gender?: string;
 }
 
+/** Describes a TTS model available on the engine. */
+export interface TtsModelInfo {
+  id: string;
+  owned_by: string;
+}
+
 /** Abstract base class for TTS engine implementations. */
 export abstract class TtsEngine {
   abstract synthesize(opts: SynthesisOptions): Promise<SynthesisResult>;
   abstract listVoices(): Promise<VoiceInfo[]>;
+
+  /**
+   * List available TTS models.  The default implementation returns the
+   * two OpenAI-compatible stub entries; engines that manage real models
+   * should override this.
+   */
+  async listModels(): Promise<TtsModelInfo[]> {
+    return [
+      { id: "tts-1", owned_by: "lms-speaks" },
+      { id: "tts-1-hd", owned_by: "lms-speaks" },
+    ];
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -397,5 +415,182 @@ export class SystemTtsEngine extends TtsEngine {
         .filter((v): v is NonNullable<typeof v> => v !== null);
       resolve(voices.length ? voices : [{ id: "default", name: "Default" }]);
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// LmStudioTtsEngine – delegates synthesis to a TTS model loaded in LM Studio
+// ---------------------------------------------------------------------------
+
+/** Options for constructing an {@link LmStudioTtsEngine}. */
+export interface LmStudioTtsEngineOptions {
+  /**
+   * An {@link LMStudioClient} instance used to discover and load TTS models.
+   * When omitted the engine operates in "API-only" mode – it still forwards
+   * synthesis requests to the LM Studio HTTP server but cannot list or
+   * auto-load models.
+   */
+  client?: import("@lmstudio/sdk").LMStudioClient;
+
+  /**
+   * Base URL of the LM Studio HTTP API server.
+   * Default: `http://127.0.0.1:1234`
+   */
+  apiBaseUrl?: string;
+
+  /**
+   * The model key (path) of the TTS model to load / use.  When a
+   * {@link client} is provided and the model is not yet loaded, the engine
+   * will attempt to load it on first use.
+   */
+  modelKey?: string;
+}
+
+/**
+ * Uses a TTS model loaded in LM Studio to generate speech.
+ *
+ * The engine talks to the LM Studio HTTP API server's OpenAI-compatible
+ * `/v1/audio/speech` endpoint.  When an {@link LMStudioClient} is provided
+ * the engine can additionally list downloaded TTS models and auto-load a
+ * model before the first synthesis request.
+ */
+export class LmStudioTtsEngine extends TtsEngine {
+  private readonly apiBaseUrl: string;
+  private readonly client?: import("@lmstudio/sdk").LMStudioClient;
+  private readonly modelKey?: string;
+  private modelLoaded = false;
+
+  constructor(opts: LmStudioTtsEngineOptions = {}) {
+    super();
+    this.apiBaseUrl = (opts.apiBaseUrl ?? "http://127.0.0.1:1234").replace(
+      /\/$/,
+      ""
+    );
+    this.client = opts.client;
+    this.modelKey = opts.modelKey;
+  }
+
+  /**
+   * Ensure the configured TTS model is loaded in LM Studio.
+   * If no client or modelKey was provided, this is a no-op.
+   */
+  private async ensureModelLoaded(): Promise<void> {
+    if (this.modelLoaded || !this.client || !this.modelKey) {
+      return;
+    }
+    try {
+      // Check whether the model is already loaded.
+      const loaded = await this.client.llm.listLoaded();
+      const alreadyLoaded = loaded.some(
+        (m) => m.path === this.modelKey || m.identifier === this.modelKey
+      );
+      if (!alreadyLoaded) {
+        await this.client.llm.load(this.modelKey, { verbose: true });
+      }
+      this.modelLoaded = true;
+    } catch {
+      // If model loading fails we still allow the synthesis attempt –
+      // the LM Studio server may have the model loaded externally.
+    }
+  }
+
+  async synthesize(opts: SynthesisOptions): Promise<SynthesisResult> {
+    await this.ensureModelLoaded();
+
+    const format = opts.format ?? "wav";
+    const body: Record<string, unknown> = {
+      input: opts.text,
+      response_format: format,
+    };
+    if (this.modelKey) {
+      body.model = this.modelKey;
+    }
+    if (opts.voice) {
+      body.voice = opts.voice;
+    }
+    if (opts.speed !== undefined) {
+      body.speed = opts.speed;
+    }
+
+    const res = await fetch(`${this.apiBaseUrl}/v1/audio/speech`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+
+    if (!res.ok) {
+      let detail: string;
+      try {
+        const json = (await res.json()) as { error?: { message?: string } };
+        detail = json?.error?.message ?? res.statusText;
+      } catch {
+        detail = res.statusText;
+      }
+      throw new Error(
+        `LM Studio TTS request failed (${res.status}): ${detail}`
+      );
+    }
+
+    const audio = Buffer.from(await res.arrayBuffer());
+    return { audio, format };
+  }
+
+  async listVoices(): Promise<VoiceInfo[]> {
+    // LM Studio TTS models typically do not expose a per-voice list.
+    // Return a sensible default so callers have at least one entry.
+    return [{ id: "default", name: "Default" }];
+  }
+
+  /**
+   * List TTS models that are downloaded in LM Studio.
+   * Falls back to querying the LM Studio API `/v1/models` endpoint when no
+   * SDK client is available.
+   */
+  override async listModels(): Promise<TtsModelInfo[]> {
+    // ── SDK path: filter downloaded models by the "tts" domain ──────
+    if (this.client) {
+      try {
+        const all = await this.client.system.listDownloadedModels();
+        // ModelInfo doesn't expose a `domain` field in the public types
+        // but the underlying data may contain one.  Cast to access it.
+        const ttsModels = all.filter(
+          (m) => (m as unknown as { domain?: string }).domain === "tts"
+        );
+        if (ttsModels.length > 0) {
+          return ttsModels.map((m) => ({
+            id: m.modelKey,
+            owned_by: "lmstudio",
+          }));
+        }
+        // If domain-based filtering yielded nothing, return all downloaded
+        // models so the user can still pick one.
+        return all.map((m) => ({
+          id: m.modelKey,
+          owned_by: "lmstudio",
+        }));
+      } catch {
+        // Fall through to HTTP approach.
+      }
+    }
+
+    // ── HTTP fallback: query LM Studio's /v1/models endpoint ────────
+    try {
+      const res = await fetch(`${this.apiBaseUrl}/v1/models`);
+      if (res.ok) {
+        const json = (await res.json()) as {
+          data?: Array<{ id: string; owned_by?: string }>;
+        };
+        if (json.data && json.data.length > 0) {
+          return json.data.map((m) => ({
+            id: m.id,
+            owned_by: m.owned_by ?? "lmstudio",
+          }));
+        }
+      }
+    } catch {
+      // LM Studio server may not be running yet.
+    }
+
+    return [];
   }
 }

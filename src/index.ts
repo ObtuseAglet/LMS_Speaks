@@ -28,7 +28,8 @@
 
 import { LMStudioClient } from "@lmstudio/sdk";
 import { globalConfigSchematics } from "./config.js";
-import { SystemTtsEngine } from "./tts-engine.js";
+import { SystemTtsEngine, LmStudioTtsEngine } from "./tts-engine.js";
+import type { TtsEngine } from "./tts-engine.js";
 import { TtsServer } from "./server.js";
 
 const DEFAULT_PORT = 8880;
@@ -40,8 +41,23 @@ async function main(): Promise<void> {
   if (process.env["STANDALONE"] === "true") {
     const port = Number(process.env["TTS_PORT"] ?? DEFAULT_PORT);
     const voice = process.env["TTS_VOICE"] ?? "default";
+    const engineType = process.env["TTS_ENGINE"] ?? "system";
     console.info("[LMS Speaks] Running in standalone mode.");
-    const engine = new SystemTtsEngine();
+
+    let engine: TtsEngine;
+    if (engineType === "lmstudio") {
+      const apiBaseUrl =
+        process.env["LMS_API_BASE_URL"] ?? "http://127.0.0.1:1234";
+      const modelKey = process.env["TTS_MODEL_KEY"] || undefined;
+      console.info(
+        `[LMS Speaks] Using LM Studio engine (API: ${apiBaseUrl}` +
+          (modelKey ? `, model: ${modelKey})` : ")")
+      );
+      engine = new LmStudioTtsEngine({ apiBaseUrl, modelKey });
+    } else {
+      engine = new SystemTtsEngine();
+    }
+
     const server = new TtsServer({ engine, port, defaultVoice: voice });
     await server.start();
 
@@ -84,12 +100,26 @@ async function main(): Promise<void> {
   const port =
     Number(process.env["TTS_PORT"] ?? DEFAULT_PORT);
   const voice = process.env["TTS_VOICE"] ?? "default";
+  const engineType = process.env["TTS_ENGINE"] ?? "system";
 
   console.info(
     `[LMS Speaks] Plugin registered. Starting TTS server on port ${port}…`
   );
 
-  const engine = new SystemTtsEngine();
+  let engine: TtsEngine;
+  if (engineType === "lmstudio") {
+    const apiBaseUrl =
+      process.env["LMS_API_BASE_URL"] ?? "http://127.0.0.1:1234";
+    const modelKey = process.env["TTS_MODEL_KEY"] || undefined;
+    console.info(
+      `[LMS Speaks] Using LM Studio engine (API: ${apiBaseUrl}` +
+        (modelKey ? `, model: ${modelKey})` : ")")
+    );
+    engine = new LmStudioTtsEngine({ client, apiBaseUrl, modelKey });
+  } else {
+    engine = new SystemTtsEngine();
+  }
+
   const server = new TtsServer({ engine, port, defaultVoice: voice });
   await server.start();
 
